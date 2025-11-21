@@ -2,29 +2,54 @@ const express = require("express");
 const http = require("http");
 const socketIo = require("socket.io");
 const cors = require("cors");
-const admin = require("firebase-admin");
+const { v4: uuidv4 } = require('uuid');
+const twilio = require('twilio');
+const rateLimit = require('express-rate-limit');
 require("dotenv").config();
 
 // Initialize Firebase Admin
+const admin = require('firebase-admin');
+
 const serviceAccount = {
   type: "service_account",
   project_id: process.env.FIREBASE_PROJECT_ID,
   private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-  private_key: process.env.FIREBASE_PRIVATE_KEY,
+  private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
   client_email: process.env.FIREBASE_CLIENT_EMAIL,
   client_id: process.env.FIREBASE_CLIENT_ID,
   auth_uri: "https://accounts.google.com/o/oauth2/auth",
   token_uri: "https://oauth2.googleapis.com/token",
   auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-  client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`,
+  client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${encodeURIComponent(process.env.FIREBASE_CLIENT_EMAIL)}`
 };
 
+// Initialize Firebase Admin
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: process.env.FIREBASE_DATABASE_URL,
+  databaseURL: process.env.FIREBASE_DATABASE_URL
 });
 
 const db = admin.firestore();
+
+// Initialize Twilio client
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+
+// OTP storage and rate limiting
+const otpStore = new Map();
+const OTP_EXPIRY = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+// Rate limiting for OTP requests (1 request per 5 minutes per IP)
+const otpRateLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 1, // limit each IP to 1 request per windowMs
+  message: 'Too many OTP requests, please try again after 5 minutes',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 const app = express();
 const server = http.createServer(app);
 
@@ -35,8 +60,7 @@ const io = socketIo(server, {
     methods: ["GET", "POST"],
   },
 });
-
-// Middleware
+ 
 app.use(
   cors({
     origin: process.env.FRONTEND_URL || "http://localhost:3000",
@@ -112,8 +136,277 @@ const authenticateToken = (req, res, next) => {
     return res.status(403).json({ error: "Invalid or expired token" });
   }
 };
+const normalizePhone = (raw) => {
+  if (!raw) return null;
+
+  const digits = String(raw).replace(/\D/g, ''); // păstrăm doar cifre
+
+  if (!digits) return null;
+
+  // 07xxxxxxxx  (clasic RO cu 0)
+  if (digits.length === 10 && digits.startsWith('07')) {
+    return `+4${digits}`;           // +407xxxxxxxx
+  }
+
+  // 7xxxxxxxx (fără 0, user deștept sau leneș)
+  if (digits.length === 9 && digits.startsWith('7')) {
+    return `+40${digits}`;          // +407xxxxxxxx
+  }
+
+  // 407xxxxxxxx (fără +, dar cu 40)
+  if (digits.length === 11 && digits.startsWith('407')) {
+    return `+${digits}`;            // +407xxxxxxxx
+  }
+
+  // +407xxxxxxxx deja corect → ajunge aici ca "407xxxxxxxx"
+  if (digits.length === 11 && digits.startsWith('407')) {
+    return `+${digits}`;
+  }
+
+  // fallback: orice altceva, dar măcar E.164 cu +
+  return `+${digits}`;
+};
+
+ 
+const generatePriceUrl = (token) => {
+  return `${process.env.FRONTEND_URL}/price-offer/${token}`;
+};
+
+// Generate and send OTP
+app.post('/api/otp/send', otpRateLimiter, async (req, res) => {
+  try {
+    let { phoneNumber } = req.body;
+    console.log('Original phone number:', phoneNumber);
+    
+    if (!phoneNumber) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+
+         const formatted = normalizePhone(phoneNumber);
+    if (!formatted) {
+      return res.status(400).json({ error: 'Invalid phone number' });
+    }
+
+    phoneNumber = formatted;
+    console.log('Formatted phone number:', phoneNumber);
+
+
+    // Generate 4-digit OTP
+    const otp = Math.floor(1000 + Math.random() * 9000).toString();
+    const expiryTime = Date.now() + OTP_EXPIRY;
+    
+    // Store OTP along with any user data from the request
+    otpStore.set(phoneNumber, { 
+      otp, 
+      expiryTime,
+      userData: req.body.userData // Store any additional user data
+    });
+
+    // Send OTP via Twilio
+    await twilioClient.messages.create({
+      body: `Acesta este codul pentru a afla pretul din oferta Weesuals Studio: ${otp}
+       Daca nu ai cerut niciun pret, ignora acest mesaj!`,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: phoneNumber
+    });
+
+    res.status(200).json({ message: 'OTP sent successfully' });
+  } catch (error) {
+    console.error('Error sending OTP:', error);
+    res.status(500).json({ error: 'Failed to send OTP' });
+  }
+});
+
+// Verify OTP
+app.post('/api/otp/verify', async (req, res) => {
+  try {
+        let { phoneNumber, otp } = req.body;
+    
+    if (!phoneNumber || !otp) {
+      return res.status(400).json({ error: 'Phone number and OTP are required' });
+    }
+
+    const formatted = normalizePhone(phoneNumber);
+    if (!formatted) {
+      return res.status(400).json({ error: 'Invalid phone number' });
+    }
+
+    phoneNumber = formatted;
+
+    const storedData = otpStore.get(phoneNumber);
+
+    
+    if (!storedData) {
+      return res.status(400).json({ error: 'No OTP found for this number' });
+    }
+
+       const { otp: storedOtp, expiryTime } = storedData;
+
+    // Check if OTP is expired
+    if (Date.now() > expiryTime) {
+      otpStore.delete(phoneNumber);
+      return res.status(400).json({ error: 'OTP has expired' });
+    }
+
+    // Normalize OTP values (în caz că vin ca number / cu spații)
+    const inputOtp = String(otp).replace(/\D/g, '').trim();
+    const savedOtp = String(storedOtp).replace(/\D/g, '').trim();
+
+    console.log('Comparing OTP:', { inputOtp, savedOtp });
+
+    if (inputOtp.length !== 4 || savedOtp.length !== 4) {
+      return res.status(400).json({ error: 'Invalid OTP format' });
+    }
+
+    if (inputOtp !== savedOtp) {
+      return res.status(400).json({ error: 'Invalid OTP' });
+    }
+
+
+    // Get the user data that was stored when OTP was generated
+    const userData = storedData.userData || {};
+    
+    // Generate a session token
+    const sessionToken = uuidv4();
+    
+    // Save user data to Firestore
+    try {
+      const userRef = db.collection('verifiedUsers').doc(phoneNumber);
+      await userRef.set({
+        phoneNumber,
+        ...userData,
+        verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastActive: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+      
+      console.log(`User data saved for ${phoneNumber}`);
+    } catch (dbError) {
+      console.error('Error saving user data to Firestore:', dbError);
+      // Don't fail the request if Firestore save fails
+    }
+    
+    // Clear OTP from memory
+    otpStore.delete(phoneNumber);
+    
+    res.status(200).json({ 
+      message: 'OTP verified successfully',
+      sessionToken,
+      expiresIn: OTP_EXPIRY
+    });
+  } catch (error) {
+    console.error('Error verifying OTP:', error);
+    res.status(500).json({ error: 'Failed to verify OTP' });
+  }
+});
 
 // Routes
+// Handle price request
+app.post("/api/price-request", async (req, res) => {
+  try {
+    const { email, priceData } = req.body;
+
+    if (!email || !priceData) {
+      return res.status(400).json({ error: 'Email and price data are required' });
+    }
+
+    // Generate token and save only minimal data to Firestore
+    const token = uuidv4();
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours from now
+
+    const priceOffer = {
+      email,
+      token,
+      priceData: {
+        videosPerWeek: priceData.videosPerWeek,
+        postsPerWeek: priceData.postsPerWeek,
+        includeAdManagement: priceData.includeAdManagement,
+        videoCost: priceData.videoCost,
+        postCost: priceData.postCost,
+        adCost: priceData.adCost,
+        totalPrice: priceData.totalPrice,
+        requestedAt: serverTimestamp()
+      },
+      expiresAt: expiresAt.toISOString(),
+      isUsed: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
+    };
+
+    // Save to Firestore
+    await setDoc(doc(db, 'priceOffers', token), priceOffer);
+    console.log('Price offer token saved to Firestore');
+
+    const priceUrl = generatePriceUrl(token);
+    res.json({ success: true, token, priceUrl });
+  } catch (error) {
+    console.error('Error processing price request:', error);
+    res.status(500).json({ error: 'Failed to process price request' });
+  }
+});
+
+// Get price offer by token
+app.get("/api/price-offer/:token", async (req, res) => {
+  try {
+    const { token } = req.params;
+    const offerRef = doc(db, 'priceOffers', token);
+    const offerSnap = await getDoc(offerRef);
+    
+    if (!offerSnap.exists()) {
+      return res.status(404).json({ error: 'Price offer not found' });
+    }
+    
+    const offer = offerSnap.data();
+    
+    // Check if offer is expired
+    const now = new Date();
+    const expiresAt = new Date(offer.expiresAt);
+    
+    if (now > expiresAt) {
+      return res.status(400).json({ error: 'This price offer has expired' });
+    }
+    
+    // Mark as used and update the offer in Firestore
+    if (!offer.isUsed) {
+      await updateDoc(offerRef, {
+        isUsed: true,
+        usedAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
+      });
+      
+      console.log('Price offer marked as used in Firestore:', { token, email: offer.email });
+      offer.usedAt = new Date().toISOString();
+    }
+
+    // Return the price data in the expected format
+    res.json({ 
+      success: true, 
+      offer: {
+        priceData: {
+          videosPerWeek: offer.priceData.videosPerWeek,
+          postsPerWeek: offer.priceData.postsPerWeek,
+          includeAdManagement: offer.priceData.includeAdManagement,
+          videoCost: offer.priceData.videoCost,
+          postCost: offer.priceData.postCost,
+          adCost: offer.priceData.adCost,
+          totalPrice: offer.priceData.totalPrice,
+          requestedAt: offer.priceData.requestedAt
+        },
+        email: offer.email,
+        token: offer.token,
+        isUsed: offer.isUsed,
+        usedAt: offer.usedAt,
+        expiresAt: offer.expiresAt,
+        createdAt: offer.createdAt
+      } 
+    });
+  } catch (error) {
+    console.error('Error fetching price offer:', error);
+    res.status(500).json({ error: 'Failed to fetch price offer' });
+  }
+});
+
+// Contact form submission
 app.post("/api/contact", async (req, res) => {
   try {
     const { name, email, service, budget, description } = req.body;
@@ -350,6 +643,26 @@ app.delete("/api/admin/users/:id", authenticateToken, async (req, res) => {
 // Health check endpoint
 app.get("/api/health", (req, res) => {
   res.json({ success: true, message: "Server is running" });
+});
+
+// Get all verified users
+app.get('/api/admin/verified-users', authenticateToken, async (req, res) => {
+  try {
+    const snapshot = await db.collection('verifiedUsers').orderBy('requestedAt', 'desc').get();
+    const users = [];
+    
+    snapshot.forEach(doc => {
+      users.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    res.json(users);
+  } catch (error) {
+    console.error('Error fetching verified users:', error);
+    res.status(500).json({ error: 'Failed to fetch verified users' });
+  }
 });
 
 const PORT = process.env.PORT || 5000;
