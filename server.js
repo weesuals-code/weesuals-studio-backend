@@ -5,6 +5,7 @@ const cors = require("cors");
 const { v4: uuidv4 } = require('uuid');
 const twilio = require('twilio');
 const rateLimit = require('express-rate-limit');
+const { calculatePrice } = require('./utils/priceCalculator');
 require("dotenv").config();
 
 // Initialize Firebase Admin
@@ -40,15 +41,28 @@ const twilioClient = twilio(
 // OTP storage and rate limiting
 const otpStore = new Map();
 const OTP_EXPIRY = 5 * 60 * 1000; // 5 minutes in milliseconds
+const verifiedNumbers = new Map(); // Track verified numbers for cooldown
 
-// Rate limiting for OTP requests (1 request per 5 minutes per IP)
-const otpRateLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000, // 5 minutes
-  max: 1, // limit each IP to 1 request per windowMs
-  message: 'Too many OTP requests, please try again after 5 minutes',
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+// Rate limiting middleware that only applies to verified numbers
+const verifiedNumberRateLimiter = (req, res, next) => {
+  const { phoneNumber } = req.body;
+  if (!phoneNumber) return next();
+  
+  const formatted = normalizePhone(phoneNumber);
+  if (!formatted) return next();
+  
+  const verifiedData = verifiedNumbers.get(formatted);
+  
+  // If number was verified and cooldown hasn't expired
+  if (verifiedData && Date.now() < verifiedData.cooldownUntil) {
+    const timeLeft = Math.ceil((verifiedData.cooldownUntil - Date.now()) / 1000 / 60);
+    return res.status(429).json({ 
+      error: `Așteaptă ${timeLeft} minute înainte de a cere un nou cod.` 
+    });
+  }
+  
+  next();
+};
 
 const app = express();
 const server = http.createServer(app);
@@ -173,7 +187,7 @@ const generatePriceUrl = (token) => {
 };
 
 // Generate and send OTP
-app.post('/api/otp/send', otpRateLimiter, async (req, res) => {
+app.post('/api/otp/send', verifiedNumberRateLimiter, async (req, res) => {
   try {
     let { phoneNumber } = req.body;
     console.log('Original phone number:', phoneNumber);
@@ -285,6 +299,11 @@ app.post('/api/otp/verify', async (req, res) => {
       // Don't fail the request if Firestore save fails
     }
     
+    // Set cooldown for this number (5 minutes from now)
+    verifiedNumbers.set(phoneNumber, {
+      cooldownUntil: Date.now() + (5 * 60 * 1000) // 5 minutes cooldown
+    });
+    
     // Clear OTP from memory
     otpStore.delete(phoneNumber);
     
@@ -314,6 +333,13 @@ app.post("/api/price-request", async (req, res) => {
     const now = new Date();
     const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours from now
 
+    // Recalculate prices on the server side to ensure consistency
+    const { videoCost, postCost, adCost, totalPrice } = calculatePrice(
+      priceData.videosPerWeek,
+      priceData.postsPerWeek,
+      priceData.includeAdManagement
+    );
+
     const priceOffer = {
       email,
       token,
@@ -321,10 +347,10 @@ app.post("/api/price-request", async (req, res) => {
         videosPerWeek: priceData.videosPerWeek,
         postsPerWeek: priceData.postsPerWeek,
         includeAdManagement: priceData.includeAdManagement,
-        videoCost: priceData.videoCost,
-        postCost: priceData.postCost,
-        adCost: priceData.adCost,
-        totalPrice: priceData.totalPrice,
+        videoCost,
+        postCost,
+        adCost,
+        totalPrice,
         requestedAt: serverTimestamp()
       },
       expiresAt: expiresAt.toISOString(),
